@@ -1,0 +1,7 @@
+model*
+outputs/
+unsloth_compiled_cache/
+wandb/
+.env
+nohup*
+dataset/*

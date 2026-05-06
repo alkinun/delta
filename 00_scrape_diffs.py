@@ -74,7 +74,12 @@ class DiffExample:
 # ── GitHub API ────────────────────────────────────────────────────────────────
 def gh_get(url: str, params: dict = None) -> Optional[dict]:
     for attempt in range(3):
-        r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        try:
+            r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        except requests.exceptions.RequestException as e:
+            print(f"  Network error on attempt {attempt + 1}: {e}")
+            time.sleep(2 ** attempt)
+            continue
 
         if "X-RateLimit-Remaining" in r.headers:
             remaining = r.headers["X-RateLimit-Remaining"]
@@ -83,14 +88,23 @@ def gh_get(url: str, params: dict = None) -> Optional[dict]:
                 print(f"  ⚠ Rate limit: {remaining}/{limit} remaining")
 
         if r.status_code == 200:
-            return r.json()
+            try:
+                return r.json()
+            except ValueError as e:
+                print(f"  Failed to parse JSON from {url}: {e}")
+                return None
         if r.status_code == 403:
             wait = max(int(r.headers.get("X-RateLimit-Reset", time.time() + 60)) - time.time(), 5)
             print(f"  Rate limited — sleeping {wait:.0f}s")
             time.sleep(wait)
+        elif r.status_code == 404:
+            print(f"  Not found: {url}")
+            return None
         else:
             print(f"  HTTP {r.status_code} for {url}")
             time.sleep(2 ** attempt)
+
+    print(f"  Giving up on {url} after 3 attempts")
     return None
 
 def iter_commits(owner: str, repo: str, max_pages: int):
@@ -100,6 +114,9 @@ def iter_commits(owner: str, repo: str, max_pages: int):
             params={"per_page": 100, "page": page},
         )
         if not data:
+            break
+        if not isinstance(data, list):
+            print(f"  Unexpected response type for commits: {type(data)}")
             break
         yield from data
         if len(data) < 100:
@@ -115,7 +132,8 @@ def get_file_content(owner: str, repo: str, commit_sha: str, path: str) -> Optio
         import base64
         try:
             return base64.b64decode(data["content"]).decode("utf-8")
-        except Exception:
+        except Exception as e:
+            print(f"  Failed to decode file content for {path}: {e}")
             return None
     return None
 
@@ -126,8 +144,6 @@ def parses_as_python(code: str) -> bool:
         return True
     except SyntaxError:
         return False
-
-_BRACE_RE = re.compile(r"[{}]")
 
 def _braces_balanced(code: str) -> bool:
     depth = 0
@@ -243,7 +259,12 @@ def scrape_gen(owner: str, repo: str, repo_lang: str):
     seen = 0
 
     for commit in iter_commits(owner, repo, CONFIG["max_pages"]):
-        sha, message = commit["sha"], commit["commit"]["message"]
+        try:
+            sha, message = commit["sha"], commit["commit"]["message"]
+        except (KeyError, TypeError) as e:
+            print(f"  Malformed commit object, skipping: {e}")
+            continue
+
         seen += 1
 
         if not is_good_message(message):
@@ -323,7 +344,10 @@ def print_sample(examples: list[DiffExample], n: int = 2):
 
 # ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import hashlib
     from itertools import zip_longest
+
+    os.makedirs(os.path.dirname(CONFIG["out"]), exist_ok=True)
 
     print(f"Scraping {len(CONFIG['repos'])} repos (target: {CONFIG['max_examples']} examples)")
     print("Repos: " + ", ".join(f"{o}/{r} ({l})" for o, r, l in CONFIG["repos"]))
@@ -339,35 +363,43 @@ if __name__ == "__main__":
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
     )
 
-    with open(CONFIG["out"], "w", encoding="utf-8") as outfile:
-        for results in zip_longest(*generators):
-            for result in results:
-                if result is None:
-                    continue
+    try:
+        with open(CONFIG["out"], "w", encoding="utf-8") as outfile:
+            for results in zip_longest(*generators):
+                for result in results:
+                    if result is None:
+                        continue
 
-                import hashlib
-                h = hashlib.sha256(
-                    f"{result.before}|||{result.after}".encode()
-                ).hexdigest()[:16]
-                if h in seen_hashes:
-                    continue
-                seen_hashes.add(h)
+                    h = hashlib.sha256(
+                        f"{result.before}|||{result.after}".encode()
+                    ).hexdigest()[:16]
+                    if h in seen_hashes:
+                        continue
+                    seen_hashes.add(h)
 
-                examples.append(result)
-                data = asdict(result)
-                data["before"] = "\n".join(data["before"].split("\n")[:5000])
-                data["after"]  = "\n".join(data["after"].split("\n")[:5000])
-                outfile.write(json.dumps(data, ensure_ascii=False) + "\n")
-                outfile.flush()
-                pbar.update(1)
+                    examples.append(result)
+                    try:
+                        data = asdict(result)
+                        data["before"] = "\n".join(data["before"].split("\n")[:5000])
+                        data["after"]  = "\n".join(data["after"].split("\n")[:5000])
+                        outfile.write(json.dumps(data, ensure_ascii=False) + "\n")
+                        outfile.flush()
+                    except (TypeError, ValueError, OSError) as e:
+                        print(f"  Failed to write example {result.sha[:7]}: {e}")
+                        continue
+
+                    pbar.update(1)
+
+                    if len(examples) >= CONFIG["max_examples"]:
+                        break
 
                 if len(examples) >= CONFIG["max_examples"]:
                     break
 
-            if len(examples) >= CONFIG["max_examples"]:
-                break
-
-    pbar.close()
+    except KeyboardInterrupt:
+        print(f"\n  Interrupted — saved {len(examples)} examples so far")
+    finally:
+        pbar.close()
 
     print("\n── Done ──")
     print(f"  Total: {len(examples)} examples from {len(CONFIG['repos'])} repos")
